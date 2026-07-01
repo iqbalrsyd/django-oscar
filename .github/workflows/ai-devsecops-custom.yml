@@ -1,0 +1,356 @@
+name: "AI DevSecOps \u2014 Domain Compliance (general)"
+'on':
+  workflow_call:
+    inputs:
+      detected_domain:
+        description: Domain classification from the AI agent.
+        required: false
+        type: string
+        default: general
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  payment-webhook-signature-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: find-webhook-views-without-sig-verify
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a payment-webhook.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        #!/usr/bin/env bash\nshopt -s nullglob\nfiles=$(grep -rEln --include='*.py'\
+        \ -E 'def [a-z_]*webhook\\(|@csrf_exempt' . 2>/dev/null | grep -v '/migrations/'\
+        \ | grep -v '/tests/' || true)\nif [ -z \"$files\" ]; then echo \"no webhook\
+        \ views found\"; exit 0; fi\nfail=0\nfor f in $files; do\n  if grep -qE 'def\
+        \ [a-z_]*webhook' \"$f\"; then\n    if ! grep -qE 'construct_event|verify_signature|hmac\\\
+        .compare_digest|validate_payload|webhook\\.verify|verify_webhook|WebhookSignature'\
+        \ \"$f\"; then\n      echo \"::error file=$f::webhook view missing signature\
+        \ verification (construct_event / verify_signature / hmac.compare_digest)\"\
+        \n      fail=1\n    fi\n  fi\ndone\nexit $fail\n) || inner_exit=$?\n# If the\
+        \ inner script exited non-zero and emitted no\n# '::error'/'::warning' annotation,\
+        \ synthesise one so the\n# SARIF conversion step still has a finding to record.\n\
+        if [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' payment-webhook.shell_log;\
+        \ then\n  echo \"::error file=find-webhook-views-without-sig-verify::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: payment-webhook-no-sig-verify
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: payment-webhook-no-sig-verify\n\
+        \    patterns:\n      - pattern-either:\n          - pattern: |\n        \
+        \      @csrf_exempt\n              def $W(request, ...):\n               \
+        \ ...\n          - pattern: |\n              def $W(request, ...):\n     \
+        \           ...\n      - metavariable-regex:\n          metavariable: $W\n\
+        \          regex: '(?i).*webhook.*'\n      - pattern-not-inside: |\n     \
+        \     ...\n          ...\n          construct_event(...)\n          ...\n\
+        \          ...\n      - pattern-not-inside: |\n          ...\n          ...\n\
+        \          verify_signature(...)\n          ...\n          ...\n    message:\
+        \ >-\n      Payment webhook view $W does not call construct_event / verify_signature\n\
+        \      on the raw request body. An attacker can forge payment events.\n  \
+        \  languages: [python]\n    severity: ERROR\n    metadata:\n      cwe: 'CWE-345:\
+        \ Insufficient Verification of Data Authenticity'\n      owasp: 'API2:2023\
+        \ Broken Authentication'\n      confidence: HIGH\nSEMGREP_EOF\n"
+    - name: Convert payment-webhook shell_check annotations to SARIF
+      if: always()
+      run: "cat > payment-webhook_annotations_to_sarif.py <<'PY_EOF'\nimport os, re,\
+        \ json\nlog_path = 'payment-webhook.shell_log'\nsarif_path = 'payment-webhook-results.sarif'\n\
+        tool_name = 'payment-webhook'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-payment-webhook'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 payment-webhook_annotations_to_sarif.py\n"
+    - name: Ensure payment-webhook-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s payment-webhook-results.sarif ]; then\n  echo \"::notice::payment-webhook\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"payment-webhook\",' \\\n    '        \
+        \  \"version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > payment-webhook-results.sarif\n\
+        fi\necho \"\u2713 payment-webhook-results.sarif size: $(stat -c%s payment-webhook-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload payment-webhook SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: payment-webhook-results.sarif
+        category: payment-webhook
+  data-django-orm-bypass-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: grep-raw-sql-with-format-strings
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a data-orm-bypass.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        #!/usr/bin/env bash\nv1=$(grep -rEn --include='*.py' '\\.raw\\([^)]*%[sdf]|\\\
+        .raw\\(f[\"\\x27]' . 2>/dev/null | grep -v '/migrations/' | grep -v '/tests/'\
+        \ || true)\nv2=$(grep -rEn --include='*.py' 'cursor\\(\\)\\.execute\\([^,)]*%[sdf]|cursor\\\
+        (\\)\\.execute\\(f[\"\\x27]' . 2>/dev/null | grep -v '/migrations/' | grep\
+        \ -v '/tests/' || true)\nv3=$(grep -rEn --include='*.py' '\\.extra\\([^)]*%[sdf]|\\\
+        .extra\\(where=\\[' . 2>/dev/null | grep -v '/migrations/' | grep -v '/tests/'\
+        \ || true)\ncombined=\"$v1$v2$v3\"\nif [ -n \"$combined\" ]; then\n  echo\
+        \ \"::group::Suspicious Django ORM bypass with string interpolation (CWE-89)\"\
+        \n  echo \"$v1\"\n  echo \"$v2\"\n  echo \"$v3\"\n  echo \"::endgroup::\"\n\
+        \  exit 1\nfi\nexit 0\n) || inner_exit=$?\n# If the inner script exited non-zero\
+        \ and emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' data-orm-bypass.shell_log; then\n\
+        \  echo \"::error file=grep-raw-sql-with-format-strings::shell check failed\
+        \ (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: django-orm-bypass-injection
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: django-orm-bypass-injection\n\
+        \    patterns:\n      - pattern-either:\n          - pattern: $MODEL.objects.raw(f\"\
+        ...{...}...\", ...)\n          - pattern: $MODEL.objects.raw(\"...\" % ...,\
+        \ ...)\n          - pattern: $MODEL.objects.raw(\"...\".format(...), ...)\n\
+        \          - pattern: $QS.extra(where=[f\"...{...}...\"])\n          - pattern:\
+        \ $QS.extra(where=[\"...\" % ...])\n          - pattern: connection.cursor().execute(f\"\
+        ...{...}...\")\n          - pattern: connection.cursor().execute(\"...\" %\
+        \ ...)\n          - pattern: connections[$DB].cursor().execute(f\"...{...}...\"\
+        )\n    message: >-\n      Django ORM bypass with string interpolation \u2014\
+        \ use parameterized queries\n      (e.g. cursor.execute(sql, [params]) or\
+        \ .raw(sql, [params])).\n    languages: [python]\n    severity: ERROR\n  \
+        \  metadata:\n      cwe: 'CWE-89: SQL Injection'\n      owasp: 'A03:2021 Injection'\n\
+        \      confidence: HIGH\nSEMGREP_EOF\n"
+    - name: Convert data-orm-bypass shell_check annotations to SARIF
+      if: always()
+      run: "cat > data-orm-bypass_annotations_to_sarif.py <<'PY_EOF'\nimport os, re,\
+        \ json\nlog_path = 'data-orm-bypass.shell_log'\nsarif_path = 'data-orm-bypass-results.sarif'\n\
+        tool_name = 'data-orm-bypass'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-data-orm-bypass'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 data-orm-bypass_annotations_to_sarif.py\n"
+    - name: Ensure data-orm-bypass-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s data-orm-bypass-results.sarif ]; then\n  echo \"::notice::data-orm-bypass\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"data-orm-bypass\",' \\\n    '        \
+        \  \"version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > data-orm-bypass-results.sarif\n\
+        fi\necho \"\u2713 data-orm-bypass-results.sarif size: $(stat -c%s data-orm-bypass-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload data-orm-bypass SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: data-orm-bypass-results.sarif
+        category: data-orm-bypass
+  auth-django-settings-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: audit-django-settings-flags
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a auth-settings.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        #!/usr/bin/env bash\nshopt -s nullglob\nmapfile -t settings < <(find . -type\
+        \ f \\( -name 'settings.py' -o -name 'base.py' -o -name 'settings_prod.py'\
+        \ -o -name 'production.py' \\) 2>/dev/null | grep -v migrations | grep -v\
+        \ node_modules | head -10)\nif [ ${#settings[@]} -eq 0 ]; then echo \"no Django\
+        \ settings file found\"; exit 0; fi\nfail=0\nfor s in \"${settings[@]}\";\
+        \ do\n  for flag in SESSION_COOKIE_SECURE CSRF_COOKIE_SECURE SECURE_SSL_REDIRECT;\
+        \ do\n    line=$(grep -E \"^${flag}\\s*=\" \"$s\" | tail -1 || true)\n   \
+        \ if echo \"$line\" | grep -qE '=\\s*(False|0)\\s*(#.*)?$'; then\n      echo\
+        \ \"::error file=$s::${flag} is disabled (line: $line)\"\n      fail=1\n \
+        \   fi\n  done\n  hsts=$(grep -E '^SECURE_HSTS_SECONDS\\s*=' \"$s\" | tail\
+        \ -1 || true)\n  if echo \"$hsts\" | grep -qE '=\\s*0\\s*(#.*)?$'; then\n\
+        \    echo \"::error file=$s::SECURE_HSTS_SECONDS=0 disables HSTS\"\n    fail=1\n\
+        \  fi\n  if grep -qE \"MD5PasswordHasher\" \"$s\"; then\n    echo \"::error\
+        \ file=$s::MD5PasswordHasher is cryptographically broken (CWE-916)\"\n   \
+        \ fail=1\n  fi\n  if grep -qE \"PBKDF2PasswordHasher[^,)]*1_000\\b|PBKDF2PasswordHasher[^,)]*10000\\\
+        b\" \"$s\"; then\n    echo \"::warning file=$s::PBKDF2 iteration count too\
+        \ low (< 600_000, OWASP 2023)\"\n    fail=1\n  fi\ndone\nexit $fail\n) ||\
+        \ inner_exit=$?\n# If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
+        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
+        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
+        \ auth-settings.shell_log; then\n  echo \"::error file=audit-django-settings-flags::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: django-insecure-cookie-and-hasher
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: django-session-cookie-insecure\n\
+        \    patterns:\n      - pattern-either:\n          - pattern: SESSION_COOKIE_SECURE\
+        \ = False\n          - pattern: SESSION_COOKIE_SECURE = 0\n          - pattern:\
+        \ CSRF_COOKIE_SECURE = False\n          - pattern: CSRF_COOKIE_SECURE = 0\n\
+        \          - pattern: SECURE_SSL_REDIRECT = False\n    message: >-\n     \
+        \ Django security flag is disabled in settings module. Cookies / requests\n\
+        \      will be served over plaintext HTTP, enabling session/CSRF hijacking.\n\
+        \    languages: [python]\n    severity: WARNING\n    metadata:\n      cwe:\
+        \ 'CWE-614: Sensitive Cookie in HTTPS Session Without Secure Attribute'\n\
+        \      owasp: 'A05:2021 Security Misconfiguration'\n  - id: django-weak-password-hasher\n\
+        \    pattern-either:\n      - pattern: PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher',\
+        \ ...]\n      - patterns:\n          - pattern: PASSWORD_HASHERS = [..., 'django.contrib.auth.hashers.MD5PasswordHasher',\
+        \ ...]\n    message: >-\n      MD5PasswordHasher is cryptographically broken.\
+        \ Use\n      Argon2PasswordHasher or PBKDF2PasswordHasher with iterations\
+        \ >= 600000.\n    languages: [python]\n    severity: ERROR\n    metadata:\n\
+        \      cwe: 'CWE-916: Use of Password Hash With Insufficient Computational\
+        \ Effort'\n      owasp: 'A02:2021 Cryptographic Failures'\nSEMGREP_EOF\n"
+    - name: Convert auth-settings shell_check annotations to SARIF
+      if: always()
+      run: "cat > auth-settings_annotations_to_sarif.py <<'PY_EOF'\nimport os, re,\
+        \ json\nlog_path = 'auth-settings.shell_log'\nsarif_path = 'auth-settings-results.sarif'\n\
+        tool_name = 'auth-settings'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-auth-settings'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 auth-settings_annotations_to_sarif.py\n"
+    - name: Ensure auth-settings-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s auth-settings-results.sarif ]; then\n  echo \"::notice::auth-settings\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"auth-settings\",' \\\n    '          \"\
+        version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > auth-settings-results.sarif\nfi\n\
+        echo \"\u2713 auth-settings-results.sarif size: $(stat -c%s auth-settings-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload auth-settings SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: auth-settings-results.sarif
+        category: auth-settings
